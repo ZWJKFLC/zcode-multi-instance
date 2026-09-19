@@ -101,9 +101,27 @@ def build_chunk_rules(content, label, is_main):
                     r"\}[a-z]\(\1,\"getDataBaseDir\"\)").encode(), content)
           or re.search((r"getDataBaseDir:(" + ID + r")[,}]").encode(), content))
     if not gm:
-        raise Abort("%s: getDataBaseDir getter not found" % label)
-    G = gm.group(1)
+        # 3.14+ form: the chunk has NO getDataBaseDir getter at all (the
+        # ZCODE_DATA_BASE_DIR support was dropped host-side). Instead of
+        # re-pointing sites at a getter, inject the env check into each
+        # site: `(X(),".zcode"` -> `((DATA?.trim()||X()),".zcode"`.
+        # Only bare resolver calls preceded by `(` are patched; member-call
+        # sites like `e.HOME.trim(),".zcode"` (resolveZcodeHome, remote
+        # contexts with explicit homes) are deliberately left alone.
+        G = None
+        inj_counts = {}
+        for sm in re.finditer((r'\((' + ID + r')\(\),"\.zcode"').encode(), content):
+            inj_counts[sm.group(1)] = inj_counts.get(sm.group(1), 0) + 1
+        if not inj_counts:
+            raise Abort("%s: getDataBaseDir getter not found and no injectable '.zcode' sites" % label)
+        for name, cnt in inj_counts.items():
+            old = b'(' + name + b'(),".zcode"'
+            new = (b'((process.env.ZCODE_DATA_BASE_DIR?.trim()||' + name + b'()),".zcode"')
+            rules.append((old, new, cnt,
+                          "fix2 inject DATA_BASE into %s x%d" % (name.decode(), cnt)))
+        return rules
 
+    G = gm.group(1)
     site_counts = {}
     skip_env = skip_home = 0
     for sm in re.finditer(("(" + ID + r')\(\),"\.zcode"').encode(), content):
