@@ -168,6 +168,15 @@ def build_chunk_rules(content, label, is_main):
                b'.resourcesPath,"icon_windows.png")')
         rules.append((pm.group(0), new, 1, "fix3 window icon + AUMID"))
 
+        # suffix appended to end of main chunk: lock window title to
+        # ZCODE_DESKTOP_APPLICATION_NAME (page ships a static <title>ZCode</title>)
+        build_chunk_rules.SUFFIX = (
+            b"\ntry{if(process.env.ZCODE_DESKTOP_APPLICATION_NAME){const __zi="
+            b"process.env.ZCODE_DESKTOP_APPLICATION_NAME;" + app +
+            b'.on("browser-window-created",(e,w)=>{try{w.setTitle(__zi),'
+            b"w.on(\"page-title-updated\",ev=>{ev.preventDefault(),w.setTitle(__zi)})"
+            b"}catch(x){}})}}catch(x){}\n")
+
         cm = list(re.finditer(("(" + ID + r'\(import\.meta\.dirname,"\.\./\.\./build/icon\.png"\))([,;])').encode(),
                               content))
         if len(cm) != 1:
@@ -179,13 +188,46 @@ def build_chunk_rules(content, label, is_main):
         tm = re.search((r"function (" + ID + r")\(\)\{return (" + ID + r")\.isPackaged\?(" + ID +
                         r")\(([A-Za-z_$][A-Za-z0-9_$]*)\.resourcesPath,\"tray_icon\.ico\"\):(" + ID +
                         r')\(import\.meta\.dirname,"\.\./\.\./build/icon\.ico"\)\}').encode(), content)
-        if not tm:
+        # 3.15.1+: single resolver fn with platform param (linux->icon.png else tray_icon.ico)
+        tm2 = re.search(
+            rb'function ([A-Za-z_$][A-Za-z0-9_$]{0,5})\(([A-Za-z_$][A-Za-z0-9_$]{0,5})=process\.platform\)\{return \2==="linux"\?([A-Za-z_$][A-Za-z0-9_$]{0,5})\.isPackaged\?([A-Za-z_$][A-Za-z0-9_$]*)\(([A-Za-z_$][A-Za-z0-9_$]*)\.resourcesPath,"icon\.png"\):([A-Za-z_$][A-Za-z0-9_$]{0,5})\(import\.meta\.dirname,"\.\./\.\./build/icon\.png"\):\3\.isPackaged\?\4\(\5\.resourcesPath,"tray_icon\.ico"\):([A-Za-z_$][A-Za-z0-9_$]{0,5})\(import\.meta\.dirname,"\.\./\.\./build/icon\.ico"\)\}',
+            content)
+        if tm:
+            f, tapp, tj, tres, tj2 = tm.groups()
+            tnew = (b"function " + f + b"(){return process.env.ZCODE_INSTANCE_ICON||(" + tapp +
+                    b".isPackaged?" + tj + b"(" + tres + b'.resourcesPath,"tray_icon.ico"):' + tj2 +
+                    b'(import.meta.dirname,"../../build/icon.ico"))}')
+            rules.append((tm.group(0), tnew, 1, "fix3 tray icon"))
+        elif tm2:
+            f, p2 = tm2.group(1), tm2.group(2)
+            body = tm2.group(0)[tm2.group(0).index(b"return ") + 7:-1]  # strip trailing '}'
+            tnew = (b"function " + f + b"(" + p2 + b"=process.platform){return process.env.ZCODE_INSTANCE_ICON||(" +
+                    body + b")}")
+            rules.append((tm2.group(0), tnew, 1, "fix3 tray icon (3.15+ param form)"))
+        else:
             raise Abort("main: tray_icon.ico anchor not found")
-        f, tapp, tj, tres, tj2 = tm.groups()
-        tnew = (b"function " + f + b"(){return process.env.ZCODE_INSTANCE_ICON||(" + tapp +
-                b".isPackaged?" + tj + b"(" + tres + b'.resourcesPath,"tray_icon.ico"):' + tj2 +
-                b'(import.meta.dirname,"../../build/icon.ico"))}')
-        rules.append((tm.group(0), tnew, 1, "fix3 tray icon"))
+
+        # 3.15.1+: a later official setAppUserModelId(bP(...)) overrides the
+        # instance AUMID -> taskbar buttons merge again; skip it when set.
+        am = re.search(
+            rb'process\.platform==="win32"&&([A-Za-z_$][A-Za-z0-9_$]{0,5})\.setAppUserModelId\(([A-Za-z_$][A-Za-z0-9_$]{0,5})\(([A-Za-z_$][A-Za-z0-9_$]{0,5}),\{isPackaged:\1\.isPackaged\}\)\)',
+            content)
+        if am:
+            app2, fn2, arg2 = am.group(1), am.group(2), am.group(3)
+            old = am.group(0)
+            newc = (b'process.platform==="win32"&&!process.env.ZCODE_INSTANCE_AUMID&&' + app2 +
+                    b".setAppUserModelId(" + fn2 + b"(" + arg2 + b",{isPackaged:" + app2 +
+                    b".isPackaged}))")
+            rules.append((old, newc, 1, "fix3 keep instance AUMID (3.15+)"))
+
+        # tray tooltip: setToolTip(X(F.trayTooltip)) -> prefer APPLICATION_NAME
+        tt = re.search(rb'setToolTip\((' + ID.encode() + rb')\((' + ID.encode() + rb')\.trayTooltip\)\)', content)
+        if tt:
+            tfn, tkey = tt.group(1), tt.group(2)
+            rules.append((tt.group(0),
+                          b"setToolTip(process.env.ZCODE_DESKTOP_APPLICATION_NAME||(" +
+                          tfn + b"(" + tkey + b".trayTooltip)))", 1,
+                          "fix4 tray tooltip = APPLICATION_NAME"))
 
     return rules
 
@@ -204,6 +246,8 @@ def build_patched_from(src_path):
         rules_by_path[path] = rules
         for _, _, _, desc in rules:
             report.append("  %-8s %s" % (path.rsplit("/", 2)[-2] + "/", desc))
+        if path == MAIN and getattr(build_chunk_rules, "SUFFIX", None):
+            report.append("  %-8s fix4 window title = APPLICATION_NAME" % "main/")
 
     payload = data[data_off:]
     new_payload = bytearray()
@@ -217,6 +261,9 @@ def build_patched_from(src_path):
                 n = content.count(old)
                 assert n == expect, "%s: %r found %d, expected %d" % (path, old[:60], n, expect)
                 content = content.replace(old, new)
+            if path == MAIN and getattr(build_chunk_rules, "SUFFIX", None):
+                content += build_chunk_rules.SUFFIX
+                build_chunk_rules.SUFFIX = None
             ent["size"] = len(content)
             ent["integrity"] = sha_integrity(content)
         ent["offset"] = str(cur)
